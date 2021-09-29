@@ -81,11 +81,11 @@ class PgExtractor:
             self.connection = pg_conn
             return True
         except Exception as e:
-            print(f'Error {e}')
+            logger.debug(f'Error {e}')
             self.connection = None
             return False
 
-    def extract_movies(self):
+    def extract_updated_movies(self):
         if self.is_connected():
             curs = self.connection.cursor()
             updated_time = self.state.get_state('movies_updated_at')
@@ -129,7 +129,7 @@ SELECT m.movie_id,
                                          str(title_list[-1][-1]))
                     yield title_list
             except Exception as e:
-                print(f'Error {e}')
+                logger.debug(f'Error {e}')
             finally:
                 curs.close()
 
@@ -142,7 +142,7 @@ class DataTransformer:
 
     def transform_movies(self):
         for movie_list in (
-                movies := self.extractor.extract_movies()):
+                movies := self.extractor.extract_updated_movies()):
             result = []
             for movie in movie_list:
                 movie_dict = {k: v for k, v in zip(['_id',
@@ -164,7 +164,7 @@ class DataTransformer:
                         movie_dict['imdb_rating'])
                 result.append(movie_dict)
             payload = '\n'.join([json.dumps(line) for line in result]) + '\n'
-            print(payload)
+            logger.debug(payload)
             yield payload
 
 
@@ -183,7 +183,7 @@ class EsUploader:
         for movies in movies_source:
             response = requests.post(url, data=movies,
                                      headers=self.config.movies_es.headers)
-            print(response.content)
+            logger.info(f'{response.content}')
             time.sleep(self.config.movies_es.bulk_timeout)
 
 
@@ -204,11 +204,11 @@ class EtlManager:
         while True:
             uploader.upload_movies(transformer)
             time.sleep(self.config.etl.updates_check_period)
-            print('checking updates')
+            logger.info('checking updates')
 
 
 def main():
-    print('ETL service started')
+    logger.info('ETL service started')
     config = Config.parse_file('config.json')
     app = EtlManager(config)
     app.start()
