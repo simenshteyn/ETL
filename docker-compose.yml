@@ -79,6 +79,7 @@ services:
       - django_app
 
   elasticsearch:
+    restart: always
     image: docker.elastic.co/elasticsearch/elasticsearch:7.14.1
     container_name: elasticsearch
     environment:
@@ -98,6 +99,7 @@ services:
       retries: 50
 
   kibana:
+    restart: always
     container_name: kibana
     image: docker.elastic.co/kibana/kibana:7.14.1
     environment:
@@ -127,5 +129,3 @@ services:
       dockerfile: ./postgres_to_es/Dockerfile
     depends_on:
       - kibana
-
-
