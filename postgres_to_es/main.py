@@ -1,19 +1,15 @@
-import logging
 import os
-from datetime import datetime
+import json
 import time
+import logging
+import requests
+from functools import wraps
 
 import psycopg2
-import requests
-from psycopg2.extensions import connection as _connection
 from psycopg2.extras import DictCursor
 
-import abc
-import json
-import logging
-from typing import Optional, Any
-
-from functools import wraps
+from postgres_to_es.state import State, JsonFileStorage
+from settings import Config
 
 
 def get_logger() -> logging.Logger:
@@ -31,25 +27,8 @@ def get_logger() -> logging.Logger:
 logger = get_logger()
 
 
-def retry(ExceptionToCheck, tries=4, delay=3, backoff=2, logger=logger):
-    """Retry calling the decorated function using an exponential backoff.
-
-    http://www.saltycrane.com/blog/2009/11/trying-out-retry-decorator-python/
-    original from: http://wiki.python.org/moin/PythonDecoratorLibrary#Retry
-
-    :param ExceptionToCheck: the exception to check. may be a tuple of
-        exceptions to check
-    :type ExceptionToCheck: Exception or tuple
-    :param tries: number of times to try (not retry) before giving up
-    :type tries: int
-    :param delay: initial delay between retries in seconds
-    :type delay: int
-    :param backoff: backoff multiplier e.g. value of 2 will double the delay
-        each retry
-    :type backoff: int
-    :param logger: logger to use. If None, print
-    :type logger: logging.Logger instance
-    """
+def backoff(ExceptionToCheck, tries=16, delay=0.1, backoff=2, logger=logger):
+    """Retry calling the decorated function using an exponential backoff."""
 
     def deco_retry(f):
 
@@ -70,85 +49,25 @@ def retry(ExceptionToCheck, tries=4, delay=3, backoff=2, logger=logger):
                     mdelay *= backoff
             return f(*args, **kwargs)
 
-        return f_retry  # true decorator
+        return f_retry
 
     return deco_retry
-
-
-class BaseStorage:
-    @abc.abstractmethod
-    def save_state(self, state: dict) -> None:
-        """Сохранить состояние в постоянное хранилище"""
-        pass
-
-    @abc.abstractmethod
-    def retrieve_state(self) -> dict:
-        """Загрузить состояние локально из постоянного хранилища"""
-        pass
-
-
-class JsonFileStorage(BaseStorage):
-    def __init__(self, file_path: Optional[str] = None):
-        self.file_path = file_path
-
-    def save_state(self, state: dict) -> None:
-        if self.file_path is None:
-            return
-
-        with open(self.file_path, 'w') as f:
-            json.dump(state, f)
-
-    def retrieve_state(self) -> dict:
-        if self.file_path is None:
-            logging.info(
-                'No state file provided. Continue with in-memory state')
-            return {}
-
-        try:
-            with open(self.file_path, 'r') as f:
-                data = json.load(f)
-
-            return data
-
-        except FileNotFoundError:
-            self.save_state({})
-
-
-class State:
-    """
-     Класс для хранения состояния при работе с данными, чтобы постоянно не перечитывать данные с начала.
-    Здесь представлена реализация с сохранением состояния в файл.
-    В целом ничего не мешает поменять это поведение на работу с БД или распределённым хранилищем.
-    """
-
-    def __init__(self, storage: BaseStorage):
-        self.storage = storage
-        self.state = self.retrieve_state()
-
-    def retrieve_state(self) -> dict:
-        data = self.storage.retrieve_state()
-        if not data:
-            return {}
-        return data
-
-    def set_state(self, key: str, value: Any) -> None:
-        """Установить состояние для определённого ключа"""
-        self.state[key] = value
-
-        self.storage.save_state(self.state)
-
-    def get_state(self, key: str) -> Any:
-        """Получить состояние по определённому ключу"""
-        return self.state.get(key)
 
 
 class PgExtractor:
     """Connects and extracts data from Postgres in generator form."""
 
-    def __init__(self, state: State, dsl: dict):
+    def __init__(self, state: State, config: Config):
         self.state = state
         self.connection = None
-        self.dsl = dsl
+        self.config = config
+        self.dsl = {'dbname': config.movies_pg.dsn.dbname,
+                    'user': config.movies_pg.dsn.user,
+                    'password': config.movies_pg.dsn.password,
+                    'host': config.movies_pg.dsn.host,
+                    'port': config.movies_pg.dsn.port,
+                    }
+        self.chunk_size = config.movies_pg.chunk_size
 
     def is_connected(self) -> bool:
         if self.connection:
@@ -166,7 +85,7 @@ class PgExtractor:
             self.connection = None
             return False
 
-    def extract_movies(self, chunk_size=100):
+    def extract_movies(self):
         if self.is_connected():
             curs = self.connection.cursor()
             updated_time = self.state.get_state('movies_updated_at')
@@ -174,16 +93,38 @@ class PgExtractor:
                 self.state.set_state('movies_updated_at', '1970-01-01')
                 updated_time = self.state.get_state('movies_updated_at')
             try:
-                curs.execute(f"""SELECT movie_id,
-                                        movie_title,
-                                        movie_desc,
-                                        movie_rating,
-                                        updated_at
-                                   FROM content.movies
-                                  WHERE updated_at > '{updated_time}'
-                               ORDER BY updated_at;
-                             """)
-                while title_list := curs.fetchmany(chunk_size):
+                curs.execute(f"""
+SELECT m.movie_id,
+       m.movie_rating as imdb_rating,
+       ARRAY_AGG(DISTINCT g.genre_name) AS genre,
+       m.movie_title,
+       m.movie_desc,
+       ARRAY_AGG(DISTINCT p.full_name)
+           FILTER (WHERE mp.person_role = 'director') AS director,
+       ARRAY_AGG(DISTINCT p.full_name)
+           FILTER (WHERE mp.person_role = 'actor') AS actors_names,  
+       ARRAY_AGG(DISTINCT p.full_name)
+           FILTER (WHERE mp.person_role = 'writer') AS writers_names,                                                        
+       JSON_AGG(DISTINCT jsonb_build_object('id', p.person_id,
+                                            'name', p.full_name))
+           FILTER (WHERE mp.person_role = 'actor') AS actors,
+       JSON_AGG(DISTINCT jsonb_build_object('id', p.person_id,
+                                            'name', p.full_name))
+           FILTER (WHERE mp.person_role = 'writer') AS writers,
+       m.updated_at
+  FROM content.movies AS m
+  LEFT JOIN content.movie_genres AS mg
+            ON m.movie_id = mg.movie_id
+  LEFT JOIN content.genres AS g
+            ON mg.genre_id = g.genre_id
+  LEFT JOIN content.movie_people AS mp
+            ON m.movie_id = mp.movie_id
+  LEFT JOIN content.people AS p
+            ON mp.person_id = p.person_id
+ WHERE m.updated_at > '{updated_time}'
+ GROUP BY m.movie_id, m.movie_title, m.movie_desc, m.movie_rating;
+""")
+                while title_list := curs.fetchmany(self.chunk_size):
                     self.state.set_state('movies_updated_at',
                                          str(title_list[-1][-1]))
                     yield title_list
@@ -191,12 +132,6 @@ class PgExtractor:
                 print(f'Error {e}')
             finally:
                 curs.close()
-        # TODO: добавить подключение в случае отсутствия связи, с реквизитами,
-        # загружаемыми из dsl в хранилище
-        else:
-            print('trying to connect')
-            self.connect()
-            self.extract_movies(chunk_size)
 
 
 class DataTransformer:
@@ -205,16 +140,22 @@ class DataTransformer:
     def __init__(self, extractor: PgExtractor):
         self.extractor = extractor
 
-    def transform_movies(self, chunk_size=100):
+    def transform_movies(self):
         for movie_list in (
-        movies := self.extractor.extract_movies(chunk_size)):
+                movies := self.extractor.extract_movies()):
             result = []
             for movie in movie_list:
                 movie_dict = {k: v for k, v in zip(['_id',
+                                                    'imdb_rating',
+                                                    'genre',
                                                     'title',
                                                     'description',
-                                                    'imdb_rating'], movie)}
-                # result.append(movie_dict)
+                                                    'director',
+                                                    'actors_names',
+                                                    'writers_names',
+                                                    'actors',
+                                                    'writers'
+                                                    ], movie)}
                 result.append(
                     {"index": {"_index": "movies", "_id": movie_dict['_id']}})
                 del movie_dict['_id']
@@ -223,64 +164,55 @@ class DataTransformer:
                         movie_dict['imdb_rating'])
                 result.append(movie_dict)
             payload = '\n'.join([json.dumps(line) for line in result]) + '\n'
+            print(payload)
             yield payload
 
 
 class EsUploader:
     """Loads JSON data from DataTransforer via requests into Elasticsearch."""
 
-    def __init__(self, dsl: dict, timeout=1):
-        self.dsl = dsl
-        self.timeout = timeout
-        self.headers = {'Content-Type': 'application/x-ndjson'}
-        self.url = '/_bulk?filter_path=items.*.error'
+    def __init__(self, config: Config):
+        self.config = config
 
     def upload_movies(self, source: DataTransformer):
         movies_source = source.transform_movies()
-        url = 'http://' + self.dsl['eshost'] \
-              + ':' + self.dsl['esport'] + self.url
+        url = self.config.movies_es.protocol + '://' \
+              + self.config.movies_es.host \
+              + ':' + str(self.config.movies_es.port) \
+              + self.config.movies_es.url
         for movies in movies_source:
-            response = requests.post(url, data=movies, headers=self.headers)
+            response = requests.post(url, data=movies,
+                                     headers=self.config.movies_es.headers)
             print(response.content)
-            time.sleep(self.timeout)
+            time.sleep(self.config.movies_es.bulk_timeout)
 
 
 class EtlManager:
     """Management of ETL process."""
-    def __init__(self, dsl_pg: dict, dsl_es: dict):
-        self.dsl_pg = dsl_pg
-        self.dsl_es = dsl_es
+
+    def __init__(self, config: Config):
+        self.config = config
 
     def start(self):
-        storage = JsonFileStorage('storage.json')
+        storage = JsonFileStorage(self.config.storage.path)
         state = State(storage)
-        pge = PgExtractor(state, self.dsl_pg)
-        pge.connect()
-        dtf = DataTransformer(pge)
-        uploader = EsUploader(self.dsl_es)
+        extractor = PgExtractor(state, self.config)
+        extractor.connect()
+        transformer = DataTransformer(extractor)
+        uploader = EsUploader(self.config)
 
         while True:
-            uploader.upload_movies(dtf)
-            time.sleep(5)
+            uploader.upload_movies(transformer)
+            time.sleep(self.config.etl.updates_check_period)
             print('checking updates')
 
 
 def main():
     print('ETL service started')
-    app = EtlManager(dsl_pg, dsl_es)
+    config = Config.parse_file('config.json')
+    app = EtlManager(config)
     app.start()
 
 
 if __name__ == '__main__':
-    dsl_pg = {'dbname': os.environ.get('DB_NAME', 'movies'),
-              'user': os.environ.get('DB_USER', 'postgres'),
-              'password': os.environ.get('DB_PASSWORD', 'yandex01'),
-              'host': os.environ.get('DB_HOST', '127.0.0.1'),
-              'port': os.environ.get('DB_PORT', '5432'),
-              }
-
-    dsl_es = {'eshost': os.environ.get('ES_HOST', '127.0.0.1'),
-              'esport': os.environ.get('ES_PORT', '9200'),
-              'esurl': '/_bulk?filter_path=items.*.error'}
-
     main()
