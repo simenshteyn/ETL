@@ -19,6 +19,7 @@ class ElasticsearchSettings(BaseModel):
     host: str
     port: int
     url: str
+    alive_url: str
     headers: dict
     bulk_timeout: float
 

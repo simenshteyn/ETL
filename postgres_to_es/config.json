@@ -14,6 +14,7 @@
     "host": "127.0.0.1",
     "port": 9200,
     "url": "/_bulk?filter_path=items.*.error",
+    "alive_url": "/_cluster/health?pretty",
     "headers": {"Content-Type": "application/x-ndjson"},
     "bulk_timeout": 0.1
   },

@@ -1,5 +1,6 @@
-import os
+import signal
 import json
+import sys
 import time
 import logging
 import requests
@@ -70,7 +71,9 @@ class PgExtractor:
         self.chunk_size = config.movies_pg.chunk_size
 
     def is_connected(self) -> bool:
-        if self.connection:
+        if not self.connection:
+            return False
+        elif self.connection.closed == 0:
             return True
         else:
             return False
@@ -108,6 +111,8 @@ class PgExtractor:
                 logger.debug(f'Error {e}')
             finally:
                 curs.close()
+        else:
+            self.connect()
 
     def extract_updated_movies(self):
         if self.is_connected():
@@ -156,6 +161,8 @@ SELECT m.movie_id,
                 logger.debug(f'Error {e}')
             finally:
                 curs.close()
+        else:
+            self.connect()
 
 
 class DataTransformer:
@@ -198,6 +205,21 @@ class EsUploader:
     def __init__(self, config: Config):
         self.config = config
 
+    def is_alive(self):
+        alive_url = self.config.movies_es.protocol + '://' \
+                    + self.config.movies_es.host \
+                    + ':' + str(self.config.movies_es.port) \
+                    + self.config.movies_es.alive_url
+        try:
+            response = requests.get(alive_url)
+            if response.status_code == 200:
+                return True
+            else:
+                logger.debug(f'ES server NOT alive: {response.status_code}')
+                return False
+        except Exception as e:
+            logger.debug(f'Error {e}')
+
     def upload_movies(self, source: DataTransformer):
         movies_source = source.transform_movies()
         url = self.config.movies_es.protocol + '://' \
@@ -205,10 +227,13 @@ class EsUploader:
               + ':' + str(self.config.movies_es.port) \
               + self.config.movies_es.url
         for movies in movies_source:
-            response = requests.post(url, data=movies,
-                                     headers=self.config.movies_es.headers)
-            logger.info(f'{response.content}')
-            time.sleep(self.config.movies_es.bulk_timeout)
+            try:
+                response = requests.post(url, data=movies,
+                                         headers=self.config.movies_es.headers)
+                logger.info(f'{response.content}')
+                time.sleep(self.config.movies_es.bulk_timeout)
+            except Exception as e:
+                logger.debug(f'Error: {e}')
 
 
 class EtlManager:
@@ -216,19 +241,30 @@ class EtlManager:
 
     def __init__(self, config: Config):
         self.config = config
+        self.storage = JsonFileStorage(self.config.storage.path)
+        self.state = State(self.storage)
+        self.extractor = PgExtractor(self.state, self.config)
+        self.transformer = DataTransformer(self.extractor)
+        self.uploader = EsUploader(self.config)
+        self.extractor.connect()
 
     def start(self):
-        storage = JsonFileStorage(self.config.storage.path)
-        state = State(storage)
-        extractor = PgExtractor(state, self.config)
-        extractor.connect()
-        transformer = DataTransformer(extractor)
-        uploader = EsUploader(self.config)
-
         while True:
-            if extractor.check_updated_movies():
-                uploader.upload_movies(transformer)
-            time.sleep(self.config.etl.updates_check_period)
+            self._execute()
+
+    @backoff(Exception)
+    def _execute(self):
+        if not self.extractor.is_connected():
+            self.extractor.connect()
+            raise ConnectionError('PG connection error')
+
+        if not self.uploader.is_alive():
+            raise ConnectionError('ES connection error')
+
+        if self.extractor.check_updated_movies():
+            self.uploader.upload_movies(self.transformer)
+
+        time.sleep(self.config.etl.updates_check_period)
 
 
 def main():
@@ -238,5 +274,11 @@ def main():
     app.start()
 
 
+def terminate_process():
+    logger.info('(SIGTERM) terminating process')
+    sys.exit()
+
+
 if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, terminate_process)
     main()
