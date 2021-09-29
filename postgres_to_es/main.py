@@ -85,6 +85,30 @@ class PgExtractor:
             self.connection = None
             return False
 
+    def check_updated_movies(self):
+        if self.is_connected():
+            logger.info('Checking movie updates...')
+            curs = self.connection.cursor()
+            updated_time = self.state.get_state('movies_updated_at')
+            if not updated_time:
+                self.state.set_state('movies_updated_at', '1970-01-01')
+                updated_time = self.state.get_state('movies_updated_at')
+            try:
+                curs.execute(f"""SELECT movie_id, updated_at
+                                   FROM content.movies
+                                  WHERE updated_at > '{updated_time}'
+                                  LIMIT 1;""")
+                if any_updates := curs.fetchone():
+                    logger.info('Some movies updated')
+                    return True
+                else:
+                    logger.info('No movies updated')
+                    return False
+            except Exception as e:
+                logger.debug(f'Error {e}')
+            finally:
+                curs.close()
+
     def extract_updated_movies(self):
         if self.is_connected():
             curs = self.connection.cursor()
@@ -135,7 +159,7 @@ SELECT m.movie_id,
 
 
 class DataTransformer:
-    """Tranforms data from PgExtractor into JSON optimized dictionary."""
+    """Tranforms data from PgExtractor into JSON optimized data string."""
 
     def __init__(self, extractor: PgExtractor):
         self.extractor = extractor
@@ -202,9 +226,9 @@ class EtlManager:
         uploader = EsUploader(self.config)
 
         while True:
-            uploader.upload_movies(transformer)
+            if extractor.check_updated_movies():
+                uploader.upload_movies(transformer)
             time.sleep(self.config.etl.updates_check_period)
-            logger.info('checking updates')
 
 
 def main():
