@@ -1,0 +1,131 @@
+version: '3.9'
+
+volumes:
+  static_volume:
+  postgres_data:
+  elasticsearch-data:
+
+
+services:
+  pg_db:
+    restart: always
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+    env_file:
+      - ./.env
+    build:
+      context: .
+      dockerfile: ./schema_design/Dockerfile
+    expose:
+      - ${POSTGRES_PORT}
+    healthcheck:
+      test: ["CMD-SHELL", "su postgres", "&&", "pg_isready"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  django_app:
+    restart: always
+    volumes:
+      - static_volume:/app/static
+    command: gunicorn --bind :${DJANGO_APP_PORT} --workers ${GUNICORN_WORKERS} config.wsgi:application
+    env_file:
+      - ./.env
+    build:
+      context: .
+      dockerfile: movies_admin/Djangoapp.dockerfile
+    depends_on:
+      - pg_db
+    expose:
+      - ${DJANGO_APP_PORT}
+
+  django_startapp:
+    command: >
+      sh -c "python manage.py migrate admin &&
+             python manage.py migrate auth &&
+             python manage.py migrate contenttypes &&
+             python manage.py migrate sessions &&
+             python manage.py migrate movies --fake &&
+             python manage.py createsuperuser --noinput &&
+             python load_data.py &&
+             rm db.sqlite &&
+             rm load_data.py"
+    env_file:
+      - ./.env
+    build:
+      context: .
+      dockerfile: movies_admin/Djangostartapp.dockerfile
+    depends_on:
+      pg_db:
+        condition: service_healthy
+    expose:
+      - ${DJANGO_APP_PORT}
+    profiles:
+      - init
+
+  nginx:
+    restart: always
+    volumes:
+      - static_volume:/home/app/static
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/nginx.conf
+    build:
+      context: .
+      dockerfile: ./nginx/Dockerfile
+    ports:
+      - ${NGINX_PORT}:8080
+    env_file:
+      - ./.env
+    depends_on:
+      - django_app
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.14.1
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    depends_on:
+      - nginx
+    ports:
+      - 9200:9200
+      - 9300:9300
+    healthcheck:
+      test: curl -s http://localhost:9200 >/dev/null || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 50
+
+  kibana:
+    container_name: kibana
+    image: docker.elastic.co/kibana/kibana:7.14.1
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - 5601:5601
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  elasticsearch_startapp:
+    command: >
+      sh -c "curl -XPUT -H 'Content-Type: application/json' -d@/home/curl_user/es_schema.json elasticsearch:9200/movies"
+    volumes:
+      - ./postgres_to_es/es_schema.json:/home/curl_user/es_schema.json
+    image: curlimages/curl:7.79.1
+    depends_on:
+      - kibana
+    profiles:
+      - init
+
+  etl_manager:
+    restart: always
+    command: python main.py
+    build:
+      context: .
+      dockerfile: ./postgres_to_es/Dockerfile
+    depends_on:
+      - kibana
+
+

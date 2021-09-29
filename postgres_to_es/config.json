@@ -4,14 +4,14 @@
       "dbname": "movies",
       "user": "postgres",
       "password": "yandex01",
-      "host": "127.0.0.1",
+      "host": "pg_db",
       "port": 5432
     },
     "chunk_size": 100
   },
   "movies_es": {
     "protocol": "http",
-    "host": "127.0.0.1",
+    "host": "elasticsearch",
     "port": 9200,
     "url": "/_bulk?filter_path=items.*.error",
     "alive_url": "/_cluster/health?pretty",

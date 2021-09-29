@@ -9,7 +9,7 @@ from functools import wraps
 import psycopg2
 from psycopg2.extras import DictCursor
 
-from postgres_to_es.state import State, JsonFileStorage
+from state import State, JsonFileStorage
 from settings import Config
 
 
