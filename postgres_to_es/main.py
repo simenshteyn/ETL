@@ -2,9 +2,8 @@ import signal
 import json
 import sys
 import time
-import logging
+from http import HTTPStatus
 import requests
-from functools import wraps
 
 import psycopg2
 from psycopg2.extras import DictCursor
@@ -12,47 +11,10 @@ from psycopg2.extras import DictCursor
 from state import State, JsonFileStorage
 from settings import Config
 
-
-def get_logger() -> logging.Logger:
-    """Get and set logging for debug and measure performance."""
-    logger = logging.getLogger(__name__)
-    logger.setLevel('DEBUG')
-    handler = logging.StreamHandler()
-    log_format = '%(asctime)s %(levelname)s -- %(message)s'
-    formatter = logging.Formatter(log_format)
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    return logger
-
+from log import get_logger
+from back_off import backoff
 
 logger = get_logger()
-
-
-def backoff(ExceptionToCheck, tries=16, delay=0.1, backoff=2, logger=logger):
-    """Retry calling the decorated function using an exponential backoff."""
-
-    def deco_retry(f):
-
-        @wraps(f)
-        def f_retry(*args, **kwargs):
-            mtries, mdelay = tries, delay
-            while mtries > 1:
-                try:
-                    return f(*args, **kwargs)
-                except ExceptionToCheck as e:
-                    msg = "%s, Retrying in %d seconds..." % (str(e), mdelay)
-                    if logger:
-                        logger.warning(msg)
-                    else:
-                        print(msg)
-                    time.sleep(mdelay)
-                    mtries -= 1
-                    mdelay *= backoff
-            return f(*args, **kwargs)
-
-        return f_retry
-
-    return deco_retry
 
 
 class PgExtractor:
@@ -71,36 +33,36 @@ class PgExtractor:
         self.chunk_size = config.movies_pg.chunk_size
 
     def is_connected(self) -> bool:
-        if not self.connection:
-            return False
-        elif self.connection.closed == 0:
+        if self.connection and self.connection.closed == 0:
             return True
         else:
             return False
 
-    def connect(self) -> bool:
+    def connect(self):
         try:
             pg_conn = psycopg2.connect(**self.dsl, cursor_factory=DictCursor)
             self.connection = pg_conn
-            return True
         except Exception as e:
             logger.debug(f'Error {e}')
             self.connection = None
-            return False
+
+    def get_updated_time(self):
+        updated_time = self.state.get_state('movies_updated_at')
+        if not updated_time:
+            self.state.set_state('movies_updated_at', '1970-01-01')
+            updated_time = self.state.get_state('movies_updated_at')
+        return updated_time
 
     def check_updated_movies(self):
         if self.is_connected():
             logger.info('Checking movie updates...')
             curs = self.connection.cursor()
-            updated_time = self.state.get_state('movies_updated_at')
-            if not updated_time:
-                self.state.set_state('movies_updated_at', '1970-01-01')
-                updated_time = self.state.get_state('movies_updated_at')
+            updated_time = self.get_updated_time()
             try:
-                curs.execute(f"""SELECT movie_id, updated_at
-                                   FROM content.movies
-                                  WHERE updated_at > '{updated_time}'
-                                  LIMIT 1;""")
+                curs.execute("""SELECT movie_id, updated_at
+                                  FROM content.movies
+                                 WHERE updated_at > %s
+                                 LIMIT 1;""", (updated_time,))
                 if any_updates := curs.fetchone():
                     logger.info('Some movies updated')
                     return True
@@ -117,12 +79,9 @@ class PgExtractor:
     def extract_updated_movies(self):
         if self.is_connected():
             curs = self.connection.cursor()
-            updated_time = self.state.get_state('movies_updated_at')
-            if not updated_time:
-                self.state.set_state('movies_updated_at', '1970-01-01')
-                updated_time = self.state.get_state('movies_updated_at')
+            updated_time = self.get_updated_time()
             try:
-                curs.execute(f"""
+                curs.execute("""
 SELECT m.movie_id,
        m.movie_rating as imdb_rating,
        ARRAY_AGG(DISTINCT g.genre_name) AS genre,
@@ -150,9 +109,9 @@ SELECT m.movie_id,
             ON m.movie_id = mp.movie_id
   LEFT JOIN content.people AS p
             ON mp.person_id = p.person_id
- WHERE m.updated_at > '{updated_time}'
+ WHERE m.updated_at > %s
  GROUP BY m.movie_id, m.movie_title, m.movie_desc, m.movie_rating;
-""")
+""", (updated_time,))
                 while title_list := curs.fetchmany(self.chunk_size):
                     self.state.set_state('movies_updated_at',
                                          str(title_list[-1][-1]))
@@ -176,17 +135,17 @@ class DataTransformer:
                 movies := self.extractor.extract_updated_movies()):
             result = []
             for movie in movie_list:
-                movie_dict = {k: v for k, v in zip(['_id',
-                                                    'imdb_rating',
-                                                    'genre',
-                                                    'title',
-                                                    'description',
-                                                    'director',
-                                                    'actors_names',
-                                                    'writers_names',
-                                                    'actors',
-                                                    'writers'
-                                                    ], movie)}
+                movie_dict = dict(zip(['_id',
+                                       'imdb_rating',
+                                       'genre',
+                                       'title',
+                                       'description',
+                                       'director',
+                                       'actors_names',
+                                       'writers_names',
+                                       'actors',
+                                       'writers'
+                                       ], movie))
                 result.append(
                     {"index": {"_index": "movies", "_id": movie_dict['_id']}})
                 del movie_dict['_id']
@@ -195,7 +154,7 @@ class DataTransformer:
                         movie_dict['imdb_rating'])
                 result.append(movie_dict)
             payload = '\n'.join([json.dumps(line) for line in result]) + '\n'
-            logger.debug(payload)
+            logger.debug(f'{payload[:120]}...')
             yield payload
 
 
@@ -204,15 +163,15 @@ class EsUploader:
 
     def __init__(self, config: Config):
         self.config = config
+        self.alive_url = f'{self.config.movies_es.protocol}://' \
+                         f'{self.config.movies_es.host}:' \
+                         f'{self.config.movies_es.port}' \
+                         f'{self.config.movies_es.alive_url}'
 
     def is_alive(self):
-        alive_url = self.config.movies_es.protocol + '://' \
-                    + self.config.movies_es.host \
-                    + ':' + str(self.config.movies_es.port) \
-                    + self.config.movies_es.alive_url
         try:
-            response = requests.get(alive_url)
-            if response.status_code == 200:
+            response = requests.get(self.alive_url)
+            if response.status_code == HTTPStatus.OK:
                 return True
             else:
                 logger.debug(f'ES server NOT alive: {response.status_code}')
@@ -222,10 +181,10 @@ class EsUploader:
 
     def upload_movies(self, source: DataTransformer):
         movies_source = source.transform_movies()
-        url = self.config.movies_es.protocol + '://' \
-              + self.config.movies_es.host \
-              + ':' + str(self.config.movies_es.port) \
-              + self.config.movies_es.url
+        url = f'{self.config.movies_es.protocol}://' \
+              f'{self.config.movies_es.host}:' \
+              f'{self.config.movies_es.port}' \
+              f'{self.config.movies_es.url}'
         for movies in movies_source:
             try:
                 response = requests.post(url, data=movies,
@@ -252,7 +211,7 @@ class EtlManager:
         while True:
             self._execute()
 
-    @backoff(Exception)
+    @backoff(Exception, logger=logger)
     def _execute(self):
         if not self.extractor.is_connected():
             self.extractor.connect()

@@ -31,9 +31,13 @@ class StorageSettings(BaseModel):
 class EtlSettings(BaseModel):
     updates_check_period: int
 
+class LoggingSettings(BaseModel):
+    logger_level: str
+
 
 class Config(BaseModel):
     movies_pg: PostgresSettings
     movies_es: ElasticsearchSettings
     storage: StorageSettings
     etl: EtlSettings
+    log: LoggingSettings

@@ -23,5 +23,8 @@
   },
   "etl": {
     "updates_check_period": 5
+  },
+  "log": {
+    "logger_level": "DEBUG"
   }
 }
