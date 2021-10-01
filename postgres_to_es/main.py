@@ -1,4 +1,3 @@
-import random
 import signal
 import json
 import sys
@@ -11,7 +10,6 @@ from psycopg2.extras import DictCursor
 
 from state import State, JsonFileStorage
 from settings import Config
-
 from log import get_logger
 from back_off import backoff
 
@@ -66,33 +64,31 @@ class PgExtractor:
 
     @backoff(Exception, logger=logger)
     def check_updated_movies(self):
-        if self.is_connected():
-            logger.info('Checking movie updates...')
-            curs = self.connection.cursor()
-            updated_time = self.get_updated_time()
-            try:
-                curs.execute("""SELECT movie_id, updated_at
-                                  FROM content.movies
-                                 WHERE updated_at > %s
-                                 LIMIT 1;""", (updated_time,))
-                if any_updates := curs.fetchone():
-                    logger.info('Some movies updated')
-                    return True
-                else:
-                    logger.info('No movies updated')
-                    return False
-            except Exception as e:
-                raise Exception(f'Exception {e}')
-            finally:
-                curs.close()
+        logger.info('Checking movie updates...')
+        curs = self.connection.cursor()
+        updated_time = self.get_updated_time()
+        try:
+            curs.execute("""SELECT movie_id, updated_at
+                              FROM content.movies
+                             WHERE updated_at > %s
+                             LIMIT 1;""", (updated_time,))
+            if any_updates := curs.fetchone():
+                logger.info('Some movies updated')
+                return True
+            else:
+                logger.info('No movies updated')
+                return False
+        except Exception as e:
+            raise Exception(f'Exception {e}')
+        finally:
+            curs.close()
 
     @backoff(Exception, logger=logger)
     def extract_updated_movies(self):
-        if self.is_connected():
-            curs = self.connection.cursor()
-            updated_time = self.get_updated_time()
-            try:
-                curs.execute("""
+        curs = self.connection.cursor()
+        updated_time = self.get_updated_time()
+        try:
+            curs.execute("""
 SELECT m.movie_id,
        m.movie_rating as imdb_rating,
        ARRAY_AGG(DISTINCT g.genre_name) AS genre,
@@ -123,14 +119,14 @@ SELECT m.movie_id,
  WHERE m.updated_at > %s
  GROUP BY m.movie_id, m.movie_title, m.movie_desc, m.movie_rating;
 """, (updated_time,))
-                while title_list := curs.fetchmany(self.chunk_size):
-                    self.state.set_state('movies_updated_at',
-                                         str(title_list[-1][-1]))
-                    yield title_list
-            except Exception as e:
-                raise Exception(f'Exception {e}')
-            finally:
-                curs.close()
+            while title_list := curs.fetchmany(self.chunk_size):
+                self.state.set_state('movies_updated_at',
+                                     str(title_list[-1][-1]))
+                yield title_list
+        except Exception as e:
+            raise Exception(f'Exception {e}')
+        finally:
+            curs.close()
 
 
 class DataTransformer:
