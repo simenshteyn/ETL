@@ -1,3 +1,4 @@
+import random
 import signal
 import json
 import sys
@@ -38,10 +39,20 @@ class PgExtractor:
         else:
             return False
 
+    @backoff(Exception, logger=logger)
     def connect(self):
         try:
             pg_conn = psycopg2.connect(**self.dsl, cursor_factory=DictCursor)
             self.connection = pg_conn
+        except Exception as e:
+            logger.debug(f'Postgres connection Error {e}')
+            self.connection = None
+            raise Exception(f'Postgres exception: {e}')
+
+    def disconnect(self):
+        try:
+            self.connection.close()
+            self.connection = None
         except Exception as e:
             logger.debug(f'Error {e}')
             self.connection = None
@@ -53,6 +64,7 @@ class PgExtractor:
             updated_time = self.state.get_state('movies_updated_at')
         return updated_time
 
+    @backoff(Exception, logger=logger)
     def check_updated_movies(self):
         if self.is_connected():
             logger.info('Checking movie updates...')
@@ -70,12 +82,11 @@ class PgExtractor:
                     logger.info('No movies updated')
                     return False
             except Exception as e:
-                logger.debug(f'Error {e}')
+                raise Exception(f'Exception {e}')
             finally:
                 curs.close()
-        else:
-            self.connect()
 
+    @backoff(Exception, logger=logger)
     def extract_updated_movies(self):
         if self.is_connected():
             curs = self.connection.cursor()
@@ -117,11 +128,9 @@ SELECT m.movie_id,
                                          str(title_list[-1][-1]))
                     yield title_list
             except Exception as e:
-                logger.debug(f'Error {e}')
+                raise Exception(f'Exception {e}')
             finally:
                 curs.close()
-        else:
-            self.connect()
 
 
 class DataTransformer:
@@ -168,6 +177,12 @@ class EsUploader:
                          f'{self.config.movies_es.port}' \
                          f'{self.config.movies_es.alive_url}'
 
+    @backoff(Exception, logger=logger)
+    def server_check(self):
+        response = requests.get(self.alive_url)
+        if response.status_code != HTTPStatus.OK:
+            raise ConnectionError('ES connection error')
+
     def is_alive(self):
         try:
             response = requests.get(self.alive_url)
@@ -179,6 +194,7 @@ class EsUploader:
         except Exception as e:
             logger.debug(f'Error {e}')
 
+    @backoff(Exception, logger=logger)
     def upload_movies(self, source: DataTransformer):
         movies_source = source.transform_movies()
         url = f'{self.config.movies_es.protocol}://' \
@@ -192,7 +208,7 @@ class EsUploader:
                 logger.info(f'{response.content}')
                 time.sleep(self.config.movies_es.bulk_timeout)
             except Exception as e:
-                logger.debug(f'Error: {e}')
+                raise Exception(f'Exception {e}')
 
 
 class EtlManager:
@@ -206,23 +222,28 @@ class EtlManager:
         self.transformer = DataTransformer(self.extractor)
         self.uploader = EsUploader(self.config)
         self.extractor.connect()
+        self.graceful_exit = False
 
     def start(self):
         while True:
             self._execute()
 
-    @backoff(Exception, logger=logger)
+    def stop(self):
+        self.graceful_exit = True
+
     def _execute(self):
+        self.extractor.connect()
         if not self.extractor.is_connected():
-            self.extractor.connect()
-            raise ConnectionError('PG connection error')
-
+            return
+        self.uploader.server_check()
         if not self.uploader.is_alive():
-            raise ConnectionError('ES connection error')
-
+            return
         if self.extractor.check_updated_movies():
             self.uploader.upload_movies(self.transformer)
-
+        self.extractor.disconnect()
+        if self.graceful_exit:
+            logger.info('Terminating app gracefully...')
+            sys.exit()
         time.sleep(self.config.etl.updates_check_period)
 
 
@@ -230,14 +251,10 @@ def main():
     logger.info('ETL service started')
     config = Config.parse_file('config.json')
     app = EtlManager(config)
+    signal.signal(signal.SIGTERM, app.stop)
+    signal.signal(signal.SIGINT, app.stop)
     app.start()
 
 
-def terminate_process():
-    logger.info('(SIGTERM) terminating process')
-    sys.exit()
-
-
 if __name__ == '__main__':
-    signal.signal(signal.SIGTERM, terminate_process)
     main()

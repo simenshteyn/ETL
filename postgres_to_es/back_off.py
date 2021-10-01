@@ -2,7 +2,6 @@ import time
 from functools import wraps
 
 
-
 def backoff(ExceptionToCheck, tries=16, delay=0.1, backoff=2, logger=None):
     """Retry calling the decorated function using an exponential backoff."""
 
