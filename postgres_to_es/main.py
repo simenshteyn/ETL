@@ -32,30 +32,26 @@ class PgExtractor:
         self.chunk_size = config.movies_pg.chunk_size
 
     def is_connected(self) -> bool:
-        if self.connection and self.connection.closed == 0:
-            return True
-        else:
-            return False
+        return bool(self.connection and self.connection.closed == 0)
 
     @backoff(Exception, logger=logger)
     def connect(self):
         try:
             pg_conn = psycopg2.connect(**self.dsl, cursor_factory=DictCursor)
             self.connection = pg_conn
-        except Exception as e:
-            logger.debug(f'Postgres connection Error {e}')
+        except Exception:
             self.connection = None
-            raise Exception(f'Postgres exception: {e}')
+            raise
 
     def disconnect(self):
         try:
             self.connection.close()
-            self.connection = None
         except Exception as e:
             logger.debug(f'Error {e}')
+        finally:
             self.connection = None
 
-    def get_updated_time(self):
+    def get_updated_time(self) -> str:
         updated_time = self.state.get_state('movies_updated_at')
         if not updated_time:
             self.state.set_state('movies_updated_at', '1970-01-01')
@@ -63,32 +59,28 @@ class PgExtractor:
         return updated_time
 
     @backoff(Exception, logger=logger)
-    def check_updated_movies(self):
+    def check_updated_movies(self) -> bool:
         logger.info('Checking movie updates...')
         curs = self.connection.cursor()
         updated_time = self.get_updated_time()
-        try:
-            curs.execute("""SELECT movie_id, updated_at
-                              FROM content.movies
-                             WHERE updated_at > %s
-                             LIMIT 1;""", (updated_time,))
-            if any_updates := curs.fetchone():
-                logger.info('Some movies updated')
-                return True
-            else:
-                logger.info('No movies updated')
-                return False
-        except Exception as e:
-            raise Exception(f'Exception {e}')
-        finally:
+        curs.execute("""SELECT movie_id, updated_at
+                          FROM content.movies
+                         WHERE updated_at > %s
+                         LIMIT 1;""", (updated_time,))
+        if any_updates := curs.fetchone():
+            logger.info('Some movies updated')
             curs.close()
+            return True
+        else:
+            logger.info('No movies updated')
+            curs.close()
+            return False
 
     @backoff(Exception, logger=logger)
     def extract_updated_movies(self):
         curs = self.connection.cursor()
         updated_time = self.get_updated_time()
-        try:
-            curs.execute("""
+        curs.execute("""
 SELECT m.movie_id,
        m.movie_rating as imdb_rating,
        ARRAY_AGG(DISTINCT g.genre_name) AS genre,
@@ -119,14 +111,9 @@ SELECT m.movie_id,
  WHERE m.updated_at > %s
  GROUP BY m.movie_id, m.movie_title, m.movie_desc, m.movie_rating;
 """, (updated_time,))
-            while title_list := curs.fetchmany(self.chunk_size):
-                self.state.set_state('movies_updated_at',
-                                     str(title_list[-1][-1]))
-                yield title_list
-        except Exception as e:
-            raise Exception(f'Exception {e}')
-        finally:
-            curs.close()
+        while title_list := curs.fetchmany(self.chunk_size):
+            yield title_list
+        curs.close()
 
 
 class DataTransformer:
@@ -149,11 +136,15 @@ class DataTransformer:
                                        'actors_names',
                                        'writers_names',
                                        'actors',
-                                       'writers'
+                                       'writers',
+                                       'updated_at'
                                        ], movie))
                 result.append(
                     {"index": {"_index": "movies", "_id": movie_dict['_id']}})
                 del movie_dict['_id']
+                self.extractor.state.set_state('movies_updated_at',
+                                               str(movie_dict['updated_at']))
+                del movie_dict['updated_at']
                 if movie_dict['imdb_rating']:
                     movie_dict['imdb_rating'] = float(
                         movie_dict['imdb_rating'])
@@ -168,10 +159,12 @@ class EsUploader:
 
     def __init__(self, config: Config):
         self.config = config
-        self.alive_url = f'{self.config.movies_es.protocol}://' \
-                         f'{self.config.movies_es.host}:' \
-                         f'{self.config.movies_es.port}' \
-                         f'{self.config.movies_es.alive_url}'
+        self.alive_url = '{protocol}://{host}:{port}{path}'.format(
+            protocol=self.config.movies_es.protocol,
+            host=self.config.movies_es.host,
+            port=self.config.movies_es.port,
+            path=self.config.movies_es.alive_url
+        )
 
     @backoff(Exception, logger=logger)
     def server_check(self):
@@ -179,7 +172,7 @@ class EsUploader:
         if response.status_code != HTTPStatus.OK:
             raise ConnectionError('ES connection error')
 
-    def is_alive(self):
+    def is_alive(self) -> bool:
         try:
             response = requests.get(self.alive_url)
             if response.status_code == HTTPStatus.OK:
@@ -189,14 +182,17 @@ class EsUploader:
                 return False
         except Exception as e:
             logger.debug(f'Error {e}')
+            return False
 
     @backoff(Exception, logger=logger)
     def upload_movies(self, source: DataTransformer):
         movies_source = source.transform_movies()
-        url = f'{self.config.movies_es.protocol}://' \
-              f'{self.config.movies_es.host}:' \
-              f'{self.config.movies_es.port}' \
-              f'{self.config.movies_es.url}'
+        url = '{protocol}://{host}:{port}{path}'.format(
+            protocol=self.config.movies_es.protocol,
+            host=self.config.movies_es.host,
+            port=self.config.movies_es.port,
+            path=self.config.movies_es.url
+        )
         for movies in movies_source:
             try:
                 response = requests.post(url, data=movies,
@@ -212,12 +208,11 @@ class EtlManager:
 
     def __init__(self, config: Config):
         self.config = config
-        self.storage = JsonFileStorage(self.config.storage.path)
-        self.state = State(self.storage)
+        storage = JsonFileStorage(self.config.storage.path)
+        self.state = State(storage)
         self.extractor = PgExtractor(self.state, self.config)
         self.transformer = DataTransformer(self.extractor)
         self.uploader = EsUploader(self.config)
-        self.extractor.connect()
         self.graceful_exit = False
 
     def start(self):
