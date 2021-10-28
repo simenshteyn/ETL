@@ -1,4 +1,4 @@
-# Deployment instructions
+## Deployment instructions
 
 1. Setup config via variables in `.env` file:\
 ``$ vi .env``
